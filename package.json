@@ -1,0 +1,41 @@
+{
+  "name": "@llmsproxy/mcp-server",
+  "version": "0.1.1",
+  "description": "MCP server for llmsproxy.ai — a JSON-RPC 2.0 bridge that connects Claude Desktop, Cursor, Cline, Zed and other MCP clients to the llmsproxy.ai gateway over stdio.",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "llm",
+    "proxy",
+    "claude",
+    "cursor",
+    "cline",
+    "openai"
+  ],
+  "homepage": "https://llmsproxy.ai",
+  "bugs": {
+    "email": "contact@llmsproxy.ai"
+  },
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/danielckv/proxiedllms-mcp.git"
+  },
+  "bin": {
+    "llmsproxy-mcp-server": "bin/cli.js"
+  },
+  "files": [
+    "bin/cli.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "optionalDependencies": {
+    "@llmsproxy/mcp-server-darwin-arm64": "0.1.1",
+    "@llmsproxy/mcp-server-darwin-x64": "0.1.1",
+    "@llmsproxy/mcp-server-linux-arm64": "0.1.1",
+    "@llmsproxy/mcp-server-linux-x64": "0.1.1",
+    "@llmsproxy/mcp-server-win32-x64": "0.1.1"
+  }
+}
