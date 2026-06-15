@@ -1,36 +1,176 @@
-# This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
-# For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
+# Cross-compiles the Go MCP server for 5 targets and publishes the 6 npm
+# packages (main + per-platform) that make up @llmsproxy/mcp-server.
+#
+# Triggers:
+#   - push of a tag matching `mcp-v*` (e.g. mcp-v0.1.0) — publishes that version
+#   - workflow_dispatch with an explicit `version` input — for hotfix re-runs
+#
+# Required repo secret:
+#   NPM_PUBLISH_TOKEN — Automation token with publish access to the @llmsproxy
+#                       npm scope. Generate at https://www.npmjs.com/settings
+#                       and add as a repository secret.
+#
+# Order matters: platform packages publish FIRST so the main package's
+# optionalDependencies resolve at install time for the first downstream user.
+# A failed platform publish short-circuits the workflow before the main package
+# ships a broken manifest. Re-running with the same version is safe — npm
+# rejects republishing the same `name@version`, so partial publishes are
+# observable (exit non-zero on the conflicting publish).
 
-name: Node.js Package
+name: Publish @llmsproxy/mcp-server (npm)
 
 on:
-  release:
-    types: [created]
+  push:
+    tags:
+      - "mcp-v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.1.0). Must match all 6 package.json files."
+        required: true
+        type: string
+      dry_run:
+        description: "Run npm publish --dry-run (no upload to registry)."
+        required: false
+        type: boolean
+        default: false
 
 jobs:
-  build:
+  publish:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - run: npm ci
-      - run: npm test
-
-  publish-gpr:
-    needs: build
-    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
-      packages: write
+    env:
+      NPM_PLATFORMS: "darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64"
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          node-version: 20
-          registry-url: https://npm.pkg.github.com/
-      - run: npm ci
-      - run: npm publish
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Resolve target version
+        id: version
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="${{ inputs.version }}"
+          else
+            # Strip the `mcp-v` prefix from the pushed tag.
+            v="${GITHUB_REF_NAME#mcp-v}"
+          fi
+          if ! echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Resolved version '$v' is not semver" && exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "→ publishing @llmsproxy/mcp-server@$v"
+
+      - name: Sync version across the 6 package.json files
         env:
-          NODE_AUTH_TOKEN: ${{secrets.GITHUB_TOKEN}}
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          node <<'JS'
+          const { readFileSync, writeFileSync } = require('node:fs');
+          const v = process.env.V;
+          const pkgs = [
+            'npm/mcp-server/package.json',
+            ...'darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64'
+              .split(' ')
+              .map(p => `npm/mcp-server-${p}/package.json`),
+          ];
+          for (const path of pkgs) {
+            const pkg = JSON.parse(readFileSync(path, 'utf8'));
+            pkg.version = v;
+            if (pkg.optionalDependencies) {
+              for (const k of Object.keys(pkg.optionalDependencies)) {
+                if (k.startsWith('@llmsproxy/mcp-server-')) {
+                  pkg.optionalDependencies[k] = v;
+                }
+              }
+            }
+            writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            console.log(`✓ ${path} → ${v}`);
+          }
+          JS
+
+      - name: Cross-compile MCP server for all 5 targets
+        env:
+          MCP_NPM_VERSION: ${{ steps.version.outputs.version }}
+        run: make mcp-npm-stage
+
+      - name: Verify staged binaries
+        run: |
+          set -euo pipefail
+          for plat in $NPM_PLATFORMS; do
+            exe=mcp-server
+            [ "$plat" = "win32-x64" ] && exe=mcp-server.exe
+            f="npm/mcp-server-$plat/bin/$exe"
+            test -s "$f" || { echo "::error::missing $f" && exit 1; }
+            echo "→ $f $(wc -c < "$f") bytes"
+          done
+
+      - name: Verify main package shim is shippable
+        # Guards against the @llmsproxy/mcp-server@0.1.0 defect where the
+        # root .gitignore's `bin/` rule (intended for the gateway build
+        # artifact dir) silently excluded npm/mcp-server/bin/cli.js from
+        # the commit. The CI checkout had no file and `npm publish` shipped
+        # a manifest-only tarball, making `npx -y @llmsproxy/mcp-server`
+        # fail with "command not found". `npm pack --dry-run` emits the
+        # exact file list `npm publish` will upload, so grepping for
+        # `bin/cli.js` in that output is the authoritative pre-publish
+        # check that the bin shim is actually present.
+        run: |
+          set -euo pipefail
+          test -s npm/mcp-server/bin/cli.js \
+            || { echo "::error::missing npm/mcp-server/bin/cli.js — root .gitignore likely re-shadowed the file"; exit 1; }
+          pack_out=$(cd npm/mcp-server && npm pack --dry-run --json 2>/dev/null)
+          echo "$pack_out" \
+            | python3 -c "import json,sys; files=json.load(sys.stdin)[0]['files']; names=[f['path'] for f in files]; print('\n'.join(names)); assert 'bin/cli.js' in names, 'bin/cli.js missing from npm pack output'"
+          echo "✓ main package shim verified shippable"
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          set -euo pipefail
+          for plat in $NPM_PLATFORMS; do
+            echo "→ publishing @llmsproxy/mcp-server-$plat"
+            (cd "npm/mcp-server-$plat" && npm publish --access public $DRY_RUN)
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          set -euo pipefail
+          echo "→ publishing @llmsproxy/mcp-server"
+          (cd npm/mcp-server && npm publish --access public $DRY_RUN)
+
+      - name: Summary
+        if: success()
+        env:
+          V: ${{ steps.version.outputs.version }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "## @llmsproxy/mcp-server published"
+            echo ""
+            echo "- version: \`$V\`"
+            echo "- dry_run: \`${DRY:-false}\`"
+            echo "- platforms: $NPM_PLATFORMS"
+            echo ""
+            echo "Verify: \`npx -y @llmsproxy/mcp-server@$V --version\`"
+          } >> "$GITHUB_STEP_SUMMARY"
