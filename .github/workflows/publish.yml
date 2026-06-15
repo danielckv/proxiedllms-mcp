@@ -1,0 +1,252 @@
+# Publishes @llmsproxy/mcp-server (main shim) plus the 5 per-platform
+# packages to the npm registry. Triggered by a `release: published`
+# event on this repository — release assets carrying the prebuilt
+# platform binaries are attached to the release before publication.
+#
+# Asset contract — the release attached to the matching tag MUST
+# contain these files (filenames are case-sensitive):
+#   mcp-server-darwin-arm64.tar.gz   contains ./mcp-server
+#   mcp-server-darwin-x64.tar.gz     contains ./mcp-server
+#   mcp-server-linux-arm64.tar.gz    contains ./mcp-server
+#   mcp-server-linux-x64.tar.gz      contains ./mcp-server
+#   mcp-server-win32-x64.zip         contains ./mcp-server.exe
+#   SHA256SUMS                       checksums for the 5 archives
+#
+# Version: the release tag MUST be `v<semver>` (e.g. `v0.2.0`). The leading
+# `v` is stripped to produce the npm version used across all 6 packages.
+#
+# Required repo secret:
+#   NPM_PUBLISH_TOKEN — Automation token with publish access to the
+#                       `@llmsproxy` scope on npm. Configure 2FA on the
+#                       publisher account; Automation tokens bypass TOTP
+#                       for CI while still requiring account-level publish
+#                       permission.
+#
+# Order matters: platform packages publish FIRST so the main package's
+# optionalDependencies resolve at install time for the very first
+# downstream user. A failed platform publish short-circuits the workflow
+# before the main package ships a manifest pointing at non-existent
+# siblings. Re-running on the same release re-publishes are rejected by
+# the registry (`npm` refuses republishing the same name@version) — the
+# recovery procedure is a patch-version bump.
+
+name: Publish @llmsproxy/mcp-server (npm)
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish from (e.g. v0.2.0). Must already exist on this repo."
+        required: true
+        type: string
+      dry_run:
+        description: "Run `npm publish --dry-run` (no upload to registry)."
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      NPM_PLATFORMS: "darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64"
+    steps:
+      - name: Checkout wrapper repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Resolve target tag + version
+        id: version
+        env:
+          INPUT_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="${{ github.event.release.tag_name }}"
+          fi
+          # Strip the leading `v` to get the npm version.
+          v="${tag#v}"
+          if ! echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::Resolved version '$v' (from tag '$tag') is not semver" && exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "→ publishing @llmsproxy/mcp-server@$v (from release $tag)"
+
+      - name: Download release binaries
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir assets \
+            --pattern 'mcp-server-*.tar.gz' \
+            --pattern 'mcp-server-*.zip' \
+            --pattern 'SHA256SUMS'
+          ls -lh assets/
+
+      - name: Verify checksums
+        working-directory: assets
+        run: |
+          set -euo pipefail
+          test -s SHA256SUMS || { echo "::error::SHA256SUMS missing from release"; exit 1; }
+          sha256sum -c SHA256SUMS
+          echo "✓ All 5 release assets pass checksum"
+
+      - name: Stage 6 npm packages from release assets
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          # ── Main package ───────────────────────────────────────────────────
+          # Copy the wrapper repo's own shim + manifest verbatim, then sync
+          # the version + optionalDependencies pins.
+          mkdir -p staging/mcp-server/bin
+          cp bin/cli.js staging/mcp-server/bin/cli.js
+          cp README.md LICENSE staging/mcp-server/
+          cp package.json staging/mcp-server/package.json
+
+          # ── 5 platform packages ────────────────────────────────────────────
+          # Generated inline (templates would be a second source of truth that
+          # drifts). Each package carries ONE binary + tight os/cpu gate.
+          for plat in $NPM_PLATFORMS; do
+            mkdir -p "staging/mcp-server-$plat/bin"
+            case "$plat" in
+              darwin-arm64) os=darwin;  cpu=arm64; exe=mcp-server;     archive="mcp-server-$plat.tar.gz" ;;
+              darwin-x64)   os=darwin;  cpu=x64;   exe=mcp-server;     archive="mcp-server-$plat.tar.gz" ;;
+              linux-arm64)  os=linux;   cpu=arm64; exe=mcp-server;     archive="mcp-server-$plat.tar.gz" ;;
+              linux-x64)    os=linux;   cpu=x64;   exe=mcp-server;     archive="mcp-server-$plat.tar.gz" ;;
+              win32-x64)    os=win32;   cpu=x64;   exe=mcp-server.exe; archive="mcp-server-$plat.zip" ;;
+            esac
+            # Extract the binary into the package's bin/.
+            case "$archive" in
+              *.tar.gz) tar -C "staging/mcp-server-$plat/bin" -xzf "assets/$archive" ;;
+              *.zip)    (cd "staging/mcp-server-$plat/bin" && unzip -q "../../../assets/$archive") ;;
+            esac
+            test -s "staging/mcp-server-$plat/bin/$exe" \
+              || { echo "::error::missing staging/mcp-server-$plat/bin/$exe"; exit 1; }
+            chmod +x "staging/mcp-server-$plat/bin/$exe" || true
+
+            # Emit the platform package manifest. Description/keywords match
+            # the main package's voice; repository.url points back at this
+            # public repo.
+            cat > "staging/mcp-server-$plat/package.json" <<JSON
+          {
+            "name": "@llmsproxy/mcp-server-$plat",
+            "version": "$V",
+            "description": "Prebuilt Go binary for @llmsproxy/mcp-server on $plat. Do not install directly; pulled in by @llmsproxy/mcp-server via optionalDependencies.",
+            "license": "Apache-2.0",
+            "homepage": "https://llmsproxy.ai",
+            "repository": {
+              "type": "git",
+              "url": "https://github.com/danielckv/proxiedllms-mcp.git"
+            },
+            "os": ["$os"],
+            "cpu": ["$cpu"],
+            "files": ["bin/$exe"]
+          }
+          JSON
+          done
+          echo "→ staged main + 5 platform packages under staging/"
+
+      - name: Sync version across all 6 package.json files
+        env:
+          V: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          node <<'JS'
+          const { readFileSync, writeFileSync } = require('node:fs');
+          const v = process.env.V;
+          const pkgs = [
+            'staging/mcp-server/package.json',
+            ...'darwin-arm64 darwin-x64 linux-arm64 linux-x64 win32-x64'
+              .split(' ')
+              .map(p => `staging/mcp-server-${p}/package.json`),
+          ];
+          for (const path of pkgs) {
+            const pkg = JSON.parse(readFileSync(path, 'utf8'));
+            pkg.version = v;
+            if (pkg.optionalDependencies) {
+              for (const k of Object.keys(pkg.optionalDependencies)) {
+                if (k.startsWith('@llmsproxy/mcp-server-')) {
+                  pkg.optionalDependencies[k] = v;
+                }
+              }
+            }
+            writeFileSync(path, JSON.stringify(pkg, null, 2) + '\n');
+            console.log(`✓ ${path} → ${v}`);
+          }
+          JS
+
+      - name: Verify main package shim is shippable
+        # Pins the exact contract `npm publish` will upload: if any
+        # `.gitignore` / `files:` interaction were to drop the shim, the
+        # workflow fails before a single PUT is sent.
+        run: |
+          set -euo pipefail
+          test -s staging/mcp-server/bin/cli.js \
+            || { echo "::error::missing staging/mcp-server/bin/cli.js"; exit 1; }
+          pack_out=$(cd staging/mcp-server && npm pack --dry-run --json 2>/dev/null)
+          echo "$pack_out" | python3 -c "
+          import json, sys
+          files = json.load(sys.stdin)[0]['files']
+          names = [f['path'] for f in files]
+          assert 'bin/cli.js' in names, 'bin/cli.js missing from npm pack output'
+          print('\n'.join(names))
+          "
+          echo "✓ main package shim verified shippable"
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          set -euo pipefail
+          for plat in $NPM_PLATFORMS; do
+            echo "→ publishing @llmsproxy/mcp-server-$plat"
+            (cd "staging/mcp-server-$plat" && npm publish --access public $DRY_RUN)
+          done
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run && '--dry-run' || '' }}
+        run: |
+          set -euo pipefail
+          echo "→ publishing @llmsproxy/mcp-server"
+          (cd staging/mcp-server && npm publish --access public $DRY_RUN)
+
+      - name: Summary
+        if: success()
+        env:
+          V: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          DRY: ${{ inputs.dry_run }}
+        run: |
+          {
+            echo "## @llmsproxy/mcp-server published"
+            echo ""
+            echo "- version: \`$V\`"
+            echo "- source release: [\`$TAG\`](https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG)"
+            echo "- dry_run: \`${DRY:-false}\`"
+            echo "- platforms: $NPM_PLATFORMS"
+            echo ""
+            echo "Verify: \`npx -y @llmsproxy/mcp-server@$V --version\`"
+          } >> "$GITHUB_STEP_SUMMARY"
